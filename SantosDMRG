@@ -1,0 +1,361 @@
+
+import numpy as np
+import scipy
+#import csv
+import matplotlib.pyplot as plt
+np.set_printoptions(suppress=True)
+
+from tenpy.models import lattice
+from tenpy.models.model import MPOModel
+from tenpy.networks import site
+from tenpy.networks import terms
+from tenpy.networks.mps import MPS
+from tenpy.networks.mpo import MPO
+from tenpy.algorithms import dmrg
+import tenpy.linalg.np_conserved as npc
+from tenpy.linalg.charges import LegCharge, ChargeInfo
+
+import h5py
+from timeit import default_timer as timer
+
+import logging
+
+from argparse import ArgumentParser
+
+def read_and_display_hdf5(file_path):
+  with h5py.File(file_path, 'r') as file:
+      print(f"Contents of the file '{file_path}':")
+      def print_attrs(name, obj):
+          print(f"    {name}")
+          for key, val in obj.attrs.items():
+              print(f"        Attribute: {key}: {val}")
+              if isinstance(obj, h5py.Dataset):
+                  print(f"        Dataset shape: {obj.shape}; Dataset dtype: {obj.dtype}")
+      file.visititems(print_attrs)
+class CavitySSHHubbardModel(MPOModel):
+    def __init__(self, L, MMax, te, to, U, g, omega, conserve):
+        # parameters
+        self.MMax = MMax            # maximum photon number
+        self.te = te                  # intra-unit cell hopping
+        self.to = to                 # inter-unit cell hopping
+        #self.tt = tt                # next-nearest-neighbor hopping
+        self.U = U                  # Hubbard interaction
+        self.g = g                  # electron-photon coupling (NOT scaled with system size)
+        self.omega = omega          # photon frequency
+        self.conserve = conserve    # conserve total particle number?
+
+        # initialize lattice
+        site_Fermion = site.FermionSite(conserve=('N' if conserve else None), filling=0.5)
+        site_Photon  = site.BosonSite(Nmax=MMax-1, conserve=None)
+        site.set_common_charges([site_Fermion, site_Photon])
+
+        reg_lat = lattice.Lattice([L], [site_Fermion, site_Photon])
+        #reg_lat = lattice.Lattice([1+int((L-1)/2)], [site_Fermion, site_Fermion, site_Photon])
+        lat = lattice.IrregularLattice(reg_lat, remove=[[i, 0 if i == 0 else 1] for i in range(0, L)])
+
+        # tensors
+        #W0 = np.zeros((1,12,MMax,MMax),dtype="complex_")
+        W0 = np.zeros((1,12,MMax,MMax))
+        W0[0,0] = np.identity(MMax)
+        W0[0,1] = scipy.linalg.expm(-g * (site_Photon.get_op('B').to_ndarray() - site_Photon.get_op('Bd').to_ndarray()))
+        W0[0,2] = scipy.linalg.expm(+g * (site_Photon.get_op('B').to_ndarray() - site_Photon.get_op('Bd').to_ndarray()))
+        W0[0,3] = scipy.linalg.expm(-2*g * (site_Photon.get_op('B').to_ndarray() - site_Photon.get_op('Bd').to_ndarray()))
+        W0[0,4] = scipy.linalg.expm(+2*g * (site_Photon.get_op('B').to_ndarray() - site_Photon.get_op('Bd').to_ndarray()))
+        W0[0,-1] = omega * site_Photon.get_op('N').to_ndarray()
+        
+        #test
+        #W0[0,1] = scipy.linalg.expm(-1j*g * (site_Photon.get_op('B').to_ndarray() + site_Photon.get_op('Bd').to_ndarray()))
+        #W0[0,2] = scipy.linalg.expm(1j*g * (site_Photon.get_op('B').to_ndarray() + site_Photon.get_op('Bd').to_ndarray()))
+
+        #Wie = np.zeros((12,12,2,2),dtype="complex_")
+        #Wio = np.zeros((12,12,2,2),dtype="complex_")
+        Wie = np.zeros((12,12,2,2))
+        Wio = np.zeros((12,12,2,2))
+
+        CD = site_Fermion.get_op('Cd').to_ndarray()
+        C = site_Fermion.get_op('C').to_ndarray()
+        JW = site_Fermion.get_op('JW').to_ndarray()
+
+        end = 11
+
+        Wie[0,0] = Wie[1,1] = Wie[2,2] = Wie[3,3] = Wie[4,4] = Wie[end,end] = np.identity(2)
+        
+        Wie[1,5] = te * C 
+        Wie[5,end] = CD
+        Wie[3,6] =0 * C 
+        Wie[6,7] = JW
+        Wie[7,end] = CD
+
+        Wie[2,8] = te * CD 
+        Wie[8,end] = C
+        Wie[4,9] = 0 * CD 
+        Wie[9,10] = JW
+        Wie[10,end] = C
+
+        # particle-hole-symmetric interaction:  U * ( n_up n_dn - (1/2) (n_up + n_dn) + 1/2 )
+        Wie[0,end] = U * ( site_Fermion.get_op('dNdN').to_ndarray())
+        
+        
+        Wio[0,0] = Wio[1,1] = Wio[2,2] = Wio[3,3] = Wio[4,4] = Wio[end,end] = np.identity(2)
+        
+        Wio[1,5] = to * C 
+        Wio[5,end] = CD
+        Wio[3,6] =0 * C 
+        Wio[6,7] = JW
+        Wio[7,end] = CD
+
+        Wio[2,8] = to * CD 
+        Wio[8,end] = C
+        Wio[4,9] = 0 * CD 
+        Wio[9,10] = JW
+        Wio[10,end] = C
+
+        # particle-hole-symmetric interaction:  U * ( n_up n_dn - (1/2) (n_up + n_dn) + 1/2 )
+        Wio[0,end] = U *( site_Fermion.get_op('dNdN').to_ndarray())
+        
+
+        # set up QN-conserving or non-conserving tensors
+        if conserve:
+            # conserve particle number and spin-z -- need to define sparse tensors
+            
+            # first, set up leg charges
+            #   leg charge for electron tensors
+            charges = np.array([
+                [ 0 ],   # 0
+                [ 0 ],   # 1
+                [ 0 ],   # 2
+                [ 0 ],   # 3
+                [ 0 ],   # 4
+
+                [ -1 ], # 5
+                [ -1 ], # 6
+                [ -1 ], # 7
+
+                [ +1 ], # 11
+                [ +1 ], # 12
+                [ +1 ], # 13
+
+                [ 0 ]    # 17
+            ])
+            
+            # leg charge for electronic sites
+            chinfo = ChargeInfo([1], ['N'])
+            cg = LegCharge.from_qflat(chinfo, charges)
+            
+            # left-side leg charge for photon tensor (trivial, since left-most bond dimension is 1)
+            cg_phot_L = LegCharge.from_qflat(chinfo, [ [0 ] ])
+
+            # create spinful electron tensor
+            We_npc = npc.Array.from_ndarray(
+                Wie, labels=['wL', 'wR', 'p', 'p*'],
+                legcharges = [
+                    cg,
+                    cg.conj(),
+                    site_Fermion.leg,
+                    site_Fermion.leg.conj()
+                ]
+            )
+            
+            Wo_npc = npc.Array.from_ndarray(
+                Wio, labels=['wL', 'wR', 'p', 'p*'],
+                legcharges = [
+                    cg,
+                    cg.conj(),
+                    site_Fermion.leg,
+                    site_Fermion.leg.conj()
+                ]
+            )
+
+            # create a single photon tensor
+            W0_npc = npc.Array.from_ndarray(
+                W0, labels=['wL', 'wR', 'p', 'p*'],
+                legcharges = [
+                    cg_phot_L,
+                    cg.conj(),
+                    site_Photon.leg,
+                    site_Photon.leg.conj()
+                ]
+            )
+        else:
+            print('no QN conservation')
+            We_npc = npc.Array.from_ndarray_trivial(Wie, labels=['wL', 'wR', 'p', 'p*'])
+            Wo_npc = npc.Array.from_ndarray_trivial(Wio, labels=['wL', 'wR', 'p', 'p*'])
+            W0_npc = npc.Array.from_ndarray_trivial(W0, labels=['wL', 'wR', 'p', 'p*'])
+            
+        # initialize MPO
+        H_MPO = MPO(lat.mps_sites(), Ws = [
+            W0_npc
+        ] + ([We_npc, Wo_npc] * int((L-1)/2)), bc='finite', IdL = 0, IdR = end)
+
+        self.cur_MPO = H_MPO
+        # initialize MPOModel
+        MPOModel.__init__(self, lat, H_MPO)
+        
+        
+
+
+# parse command-line arguments
+parser = ArgumentParser()
+parser.add_argument("--L", dest="L", help = "max # of sites, must be even", type=int, default=10)
+parser.add_argument("--Lmin", dest="Lmin", help = "min # of sites, must be even", type=int, default=4)
+parser.add_argument("--Lstep", dest="Lstep", help = "steps in # of sites, must be even", type=int, default=4)
+parser.add_argument("--MMax", dest="MMax", help = "# of boson states", type=int, default=100)
+parser.add_argument("--te", dest="te", help = "te (intra-unit cell hopping)", type=float, default=0.0)
+#parser.add_argument("--testep", dest="testep", help = "te (intra-unit cell hopping) step", type=float, default=0.1)
+parser.add_argument("--to", dest="to", help = "to (inter-unit cell hopping)", type=float, default=1.0)
+#parser.add_argument("--tostep", dest="tostep", help = "to (inter-unit cell hopping) step", type=float, default=0.1)
+parser.add_argument("--U", dest="U", help = "Hubbard interaction", type=float, default=0.0)
+parser.add_argument("--omega", dest="omegamax", help = "photon frequency", type=float, default=3.0)
+parser.add_argument("--omegastep", dest="omegastep", help = "photon frequency step", type=float, default=1.0)
+parser.add_argument("--omegamin", dest="omegamin", help = "photon frequency step", type=float, default=1.0)
+parser.add_argument("--g", dest="gmax", help = "max electron-photon coupling", type=float, default=0.05)
+parser.add_argument("--gmin", dest="gmin", help = "max electron-photon coupling", type=float, default=0.0)
+parser.add_argument("--gstep", dest="gstep", help = "step in electron-photon coupling", type=float, default=0.05)
+parser.add_argument("--chi-max", dest="chi_max", help = "maximum bond dimension", type=int, default=600)
+parser.add_argument("--svd-min", dest="svd_min", help = "SVD cutoff", type=float, default=1e-10)
+parser.add_argument("--output-dir", dest="outputDir", help = "output directory", type=str, default="")
+parser.add_argument("--conserve", dest="conserve", help = "conserve quantum numbers", action="store_true", default=True)
+parser.add_argument("--scale-g", dest="scale_g", help = "scale g via 1/sqrt(L)", action="store_true", default=True)
+parser.add_argument("--min-sweeps", dest="min_sweeps", help = "minimum number of sweeps", type=int, default=15)
+
+args = parser.parse_args()
+L = args.L
+Lmin = args.Lmin
+Lstep = args.Lstep
+MMax = args.MMax
+to = args.to
+#tostep = args.tostep
+te = args.te
+#testep = args.testep
+U = args.U
+omegamax = args.omegamax
+omegastep = args.omegastep
+omegamin = args.omegamin
+gmax = args.gmax
+gmin = args.gmin
+gstep = args.gstep
+chi_max = args.chi_max
+svd_min = args.svd_min
+conserve = args.conserve
+scale_g = args.scale_g
+min_sweeps = args.min_sweeps
+
+
+# parameter ranges
+Lrange=range(Lmin, L, Lstep)
+grange=np.arange(gmin, gmax, gstep)
+omegarange=np.arange(omegamin,omegamax,omegastep)
+
+
+#Slist=np.zeros(len(Lrange))
+#Slist=np.zeros(len(grange))
+Slist=np.zeros((len(grange),len(Lrange),len(omegarange)))
+NphotList=np.zeros((len(grange),len(Lrange),len(omegarange)))
+#Slist=np.zeros(len(omegarange))
+ESlist=np.zeros(len(Lrange))
+Olist=np.zeros(len(Lrange))
+Elist=np.zeros((len(grange),len(Lrange),len(omegarange)))
+corr_NNlist=np.zeros((len(grange),len(Lrange)))
+
+
+start0 = timer()
+
+for omega in omegarange:
+  for l in Lrange:
+    if (l%2) != 0:
+      break
+  
+    for g in grange:
+    
+      outputFile = f'{args.outputDir}output_SSH_L{l}_M{MMax}_te{round(te,1)}_to{round(to,1)}_U{U}_w{round(omega,1)}_g{round(g,2)}_chi{chi_max}_svd{svd_min}{"_scaled" if scale_g else ""}.h5'
+      #outputFileCSV = f'{args.outputDir}output_SSH_L{l}_M{MMax}_te{te}_to{to}_U{U}_w{omega}_g{g}_chi{chi_max}_svd{svd_min}{"_scaled" if scale_g else ""}.csv'
+
+      if scale_g:
+            g /= np.sqrt(l)
+    
+      # initialize model
+      model = CavitySSHHubbardModel(l + 1, MMax=MMax, te=te, to=to, U=U, g=g, omega=omega, conserve=conserve)
+
+      # create trial half-filled state
+      product_state = [ 'vac' ] + ['full']+ [ 'empty' if (n%2) == 0  else 'full' for n in range(1,l) ]
+      #product_state = [ 'vac' ] + ['empty']+ [ 'full' if (n%2) == 0 else 'empty' for n in range(1,l) ]
+      psi0 = MPS.from_product_state(model.lat.mps_sites(), product_state, bc=model.lat.bc_MPS)
+      psi_gs = psi0.copy()
+      print('Running DMRG...', flush=True)
+      start = timer()
+      dmrg_params = {
+            'mixer': True,
+            'max_E_err': 1e-4,
+            'trunc_params': {
+                  'chi_max': chi_max,
+                  'svd_min': svd_min
+          },
+          'combine': True
+      }
+      try:
+        info = dmrg.run(psi_gs, model, dmrg_params)
+        E = info['E']
+        end = timer()
+        print(f'E = {E}    final bond dimensions: {psi_gs.chi}', flush=True)
+        print(f'  Time taken: {end - start} s', flush=True)
+        
+        
+        #observables
+        
+        N_phot = psi_gs.expectation_value('N', sites = [0])
+        NN_phot = psi_gs.expectation_value('NN', sites = [0])
+        P_phot = psi_gs.expectation_value('P', sites = [0])
+        B_phot = psi_gs.expectation_value('B', sites = [0])
+        BD_phot = psi_gs.expectation_value('Bd', sites = [0])
+        Ntot_el = psi_gs.expectation_value('N', sites = np.arange(1,l+1))
+
+        corr_NN = psi_gs.correlation_function('dN', 'dN', sites1 = np.arange(1,l), sites2 = np.arange(1,l+1))
+        
+      
+      
+        
+
+        #entanglement
+        S_phot_el= psi_gs.entanglement_entropy(1,[1])
+        cut=int(l/2+1)
+        S_el_el= psi_gs.entanglement_entropy(1,[cut])
+        #ES=np.sort(-2. * np.log(psi_gs._S[cut]))
+
+        
+        ##uncomment for printing results
+        
+        #print()
+        #print('Photon:')
+        #print(f'   <n>      = {N_phot}')
+        #print(f'   <n*n>    = {NN_phot}')
+        #print(f'   <parity> = {P_phot}')
+        #print('', flush=True)
+        #print('Electron:')
+        #print(f'   <N>      = {np.sum(Ntot_el)}')
+        #print(f'   <M_z>    = {np.sum(Mag_el)}')
+        #print(f'   <DOcc>   = {np.sum(DOcc_el)}')
+        #print('', flush=True)
+  
+        #print(f' SVN_phot_el={S_phot_el}')
+        #print(f' SVN_el_el={S_el_el}')
+      
+        #writing files
+        with h5py.File(outputFile, 'w') as f:
+            f.create_dataset('/gs-energy', data = np.array([E]))
+            f.create_dataset('/chi', data = psi_gs.chi)
+            f.create_dataset('/photon_obs', data = [ N_phot, NN_phot, P_phot, B_phot, BD_phot ])
+            #f.create_dataset('/photon_obs', data = [ N_phot, NN_phot, P_phot ])
+            f.create_dataset('/electron_obs', data = [ Ntot_el])
+            f.create_dataset('/entanglement', data = [ S_phot_el, S_el_el])
+            f.create_dataset('/electron_corr_NN', data = [ corr_NN ])
+        read_and_display_hdf5(outputFile)
+      
+        #print('Writing output to: ', outputFile)
+        #print('Done.')
+      except np.linalg.LinAlgError:
+        print("LinAlgError")  
+      
+    
+  
+
+print(f'  Total time taken: {end-start0} s', flush=True)
